@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import _pickle
 import abc
-import asyncio
 import collections
 import contextlib
 import functools
 import os
 import queue
 import sys
+import threading
 import time
 import typing
 import warnings
@@ -53,8 +53,7 @@ from torchrl.collectors.utils import split_trajectories
 from torchrl.collectors.weight_update import (
     MultiProcessedWeightUpdate,
     VanillaWeightUpdater,
-    WeightUpdateReceiverBase,
-    WeightUpdateSenderBase,
+    WeightUpdaterBase,
 )
 from torchrl.data import ReplayBuffer
 from torchrl.data.tensor_specs import TensorSpec
@@ -155,41 +154,22 @@ class DataCollectorBase(IterableDataset, metaclass=abc.ABCMeta):
     trust_policy: bool
     compiled_policy: bool
     cudagraphed_policy: bool
-    _weight_update_receiver: WeightUpdateReceiverBase | None = None
-    _weight_update_sender: WeightUpdateSenderBase | None = None
+    _weight_updater: WeightUpdaterBase | None = None
 
     @property
-    def weight_update_receiver(self) -> WeightUpdateReceiverBase:
-        return self._weight_update_receiver
+    def weight_updater(self) -> WeightUpdaterBase:
+        return self._weight_updater
 
-    @weight_update_receiver.setter
-    def weight_update_receiver(
-        self,
-        value: WeightUpdateReceiverBase | Callable[[], WeightUpdateReceiverBase] | None,
-    ):
+    @weight_updater.setter
+    def weight_updater(self, value: WeightUpdaterBase | None):
         if value is not None:
-            if not isinstance(value, WeightUpdateReceiverBase) and callable(value):
+            if not isinstance(value, WeightUpdaterBase) and callable(value):
                 # then it's a constructor
                 value = value()
             value.register_collector(self)
             if value.collector is not self:
                 raise RuntimeError("Failed to register collector.")
-        self._weight_update_receiver = value
-
-    @property
-    def weight_update_sender(self) -> WeightUpdateSenderBase:
-        return self._weight_update_sender
-
-    @weight_update_sender.setter
-    def weight_update_sender(self, value: WeightUpdateSenderBase | None):
-        if value is not None:
-            if not isinstance(value, WeightUpdateSenderBase) and callable(value):
-                # then it's a constructor
-                value = value()
-            value.register_collector(self)
-            if value.collector is not self:
-                raise RuntimeError("Failed to register collector.")
-        self._weight_update_sender = value
+        self._weight_updater = value
 
     def _get_policy_and_device(
         self,
@@ -280,6 +260,36 @@ class DataCollectorBase(IterableDataset, metaclass=abc.ABCMeta):
         ).to_module(policy)
         return policy, get_original_weights
 
+    def start(self):
+        """Starts the collector for asynchronous data collection.
+
+        This method initiates the background collection of data, allowing for decoupling of data collection and training.
+
+        The collected data is typically stored in a replay buffer passed during the collector's initialization.
+
+        .. note:: After calling this method, it's essential to shut down the collector using :meth:`~.async_shutdown`
+            when you're done with it to free up resources.
+
+        .. warning:: Asynchronous data collection can significantly impact training performance due to its decoupled nature.
+            Ensure you understand the implications for your specific algorithm before using this mode.
+
+        Raises:
+            NotImplementedError: If not implemented by a subclass.
+        """
+        raise NotImplementedError(
+            f"Collector start() is not implemented for {type(self).__name__}."
+        )
+
+    def async_shutdown(self, timeout: float | None = None) -> None:
+        """Shuts down the collector when started asynchronously with the `start` method.
+
+        Arg:
+            timeout (float, optional): The maximum time to wait for the collector to shutdown.
+
+        .. seealso:: :meth:`~.start`
+        """
+        return self.shutdown(timeout=timeout)
+
     def update_policy_weights_(
         self,
         policy_weights: TensorDictBase | None = None,
@@ -299,30 +309,20 @@ class DataCollectorBase(IterableDataset, metaclass=abc.ABCMeta):
                 for the update. If not provided, the method will attempt to fetch the weights using the configured
                 weight updater.
             worker_ids (int | List[int] | torch.device | List[torch.device] | None, optional): Identifiers for the
-                workers that need to be updated. This is relevant when using a remote weights updater, which must
-                be specified during the data collector's initialization. If `worker_ids` is provided without a
-                configured remote weights updater, a TypeError will be raised.
+                workers that need to be updated. This is relevant when the collector has more than one worker associated
+                with it.
 
         Raises:
-            TypeError: If `worker_ids` is provided but no `weight_update_sender` is configured.
+            TypeError: If `worker_ids` is provided but no `weight_updater` is configured.
 
-        .. note::
-
-            - The method first attempts to update weights locally using `weight_update_receiver`, if available.
-            - If a `weight_update_sender` is configured, it will be used to update the specified remote workers.
-            - Users can extend the `WeightUpdateReceiverBase` and `WeightUpdateSenderBase` classes to customize
-              the weight update logic for specific use cases. This method should not be overwritten.
+        .. note:: Users should extend the `WeightUpdaterBase` classes to customize
+            the weight update logic for specific use cases. This method should not be overwritten.
 
         .. seealso:: :class:`~torchrl.collectors.LocalWeightsUpdaterBase` and
             :meth:`~torchrl.collectors.RemoteWeightsUpdaterBase`.
 
         """
-        if self.weight_update_receiver is not None:
-            self.weight_update_receiver(policy_weights, **kwargs)
-        if self.weight_update_sender is not None:
-            self.weight_update_sender(policy_weights, worker_ids=worker_ids, **kwargs)
-        elif worker_ids is not None:
-            raise TypeError("worker_ids was passed but weight_update_sender was None.")
+        self.weight_updater(policy_weights, worker_ids=worker_ids, **kwargs)
 
     def __iter__(self) -> Iterator[TensorDictBase]:
         try:
@@ -344,7 +344,7 @@ class DataCollectorBase(IterableDataset, metaclass=abc.ABCMeta):
             return None
 
     @abc.abstractmethod
-    def shutdown(self):
+    def shutdown(self, timeout: float | None = None) -> None:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -537,12 +537,7 @@ class SyncDataCollector(DataCollectorBase):
             or `ManiSkills <https://github.com/haosulab/ManiSkill/>`_) cuda synchronization may cause unexpected
             crashes.
             Defaults to ``False``.
-        weight_update_receiver (WeightUpdateReceiverBase or constructor, optional): An instance of :class:`~torchrl.collectors.WeightUpdateReceiverBase`
-            or its subclass, responsible for updating the policy weights on the local inference worker.
-            If not provided, a :class:`~torchrl.collectors.VanillaLocalWeightUpdater` will be used by default,
-            which directly fetches and applies the weights from the server.
-            Consider using a constructor if the updater needs to be serialized.
-        weight_update_sender (WeightUpdateSenderBase or constructor, optional): An instance of :class:`~torchrl.collectors.WeightUpdateSenderBase`
+        weight_updater (WeightUpdaterBase or constructor, optional): An instance of :class:`~torchrl.collectors.WeightUpdaterBase`
             or its subclass, responsible for updating the policy weights on remote inference workers.
             This is typically not used in :class:`~torchrl.collectors.SyncDataCollector` as it operates in a single-process environment.
             Consider using a constructor if the updater needs to be serialized.
@@ -637,11 +632,8 @@ class SyncDataCollector(DataCollectorBase):
         compile_policy: bool | dict[str, Any] | None = None,
         cudagraph_policy: bool | dict[str, Any] | None = None,
         no_cuda_sync: bool = False,
-        weight_update_receiver: WeightUpdateReceiverBase
-        | Callable[[], WeightUpdateReceiverBase]
-        | None = None,
-        weight_update_sender: WeightUpdateSenderBase
-        | Callable[[], WeightUpdateSenderBase]
+        weight_updater: WeightUpdaterBase
+        | Callable[[], WeightUpdaterBase]
         | None = None,
         **kwargs,
     ):
@@ -893,13 +885,14 @@ class SyncDataCollector(DataCollectorBase):
         self._frames = 0
         self._iter = -1
 
-        if weight_update_receiver is None:
-            weight_update_receiver = VanillaWeightUpdater(
+        if weight_updater is None:
+            weight_updater = VanillaWeightUpdater(
                 weight_getter=self.get_weights_fn, policy_weights=self.policy_weights
             )
+        elif not isinstance(weight_updater, WeightUpdaterBase):
+            raise TypeError("weight_updater must be a subclass of WeightUpdaterBase")
 
-        self.weight_update_receiver = weight_update_receiver
-        self.weight_update_sender = weight_update_sender
+        self.weight_updater = weight_updater
 
     @property
     def _traj_pool(self):
@@ -1237,26 +1230,92 @@ class SyncDataCollector(DataCollectorBase):
                     yield tensordict_out.clone()
 
     def start(self):
-        """Starts the RayCollector."""
+        """Starts the collector in a separate thread for asynchronous data collection.
+
+        The collected data is stored in the provided replay buffer. This method is useful when you want to decouple data
+        collection from training, allowing your training loop to run independently of the data collection process.
+
+        Raises:
+            RuntimeError: If no replay buffer is defined during the collector's initialization.
+
+        Example:
+            >>> import time
+            >>> from functools import partial
+            >>>
+            >>> import tqdm
+            >>>
+            >>> from torchrl.collectors import SyncDataCollector, RandomPolicy
+            >>> from torchrl.data import LazyTensorStorage, ReplayBuffer
+            >>> from torchrl.envs import GymEnv, set_gym_backend
+            >>> import ale_py
+            >>>
+            >>> # Set the gym backend to gymnasium
+            >>> set_gym_backend("gymnasium").set()
+            >>>
+            >>> if __name__ == "__main__":
+            ...     # Create a random policy for the Pong environment
+            ...     env = GymEnv("ALE/Pong-v5")
+            ...     policy = RandomPolicy(env.action_spec)
+            ...
+            ...     # Initialize a shared replay buffer
+            ...     rb = ReplayBuffer(storage=LazyTensorStorage(1000), shared=True)
+            ...
+            ...     # Create a synchronous data collector
+            ...     collector = SyncDataCollector(
+            ...         env,
+            ...         policy=policy,
+            ...         replay_buffer=rb,
+            ...         frames_per_batch=256,
+            ...         total_frames=-1,
+            ...     )
+            ...
+            ...     # Progress bar to track the number of collected frames
+            ...     pbar = tqdm.tqdm(total=100_000)
+            ...
+            ...     # Start the collector asynchronously
+            ...     collector.start()
+            ...
+            ...     # Track the write count of the replay buffer
+            ...     prec_wc = 0
+            ...     while True:
+            ...         wc = rb.write_count
+            ...         c = wc - prec_wc
+            ...         prec_wc = wc
+            ...
+            ...         # Update the progress bar
+            ...         pbar.update(c)
+            ...         pbar.set_description(f"Write Count: {rb.write_count}")
+            ...
+            ...         # Check the write count every 0.5 seconds
+            ...         time.sleep(0.5)
+            ...
+            ...         # Stop when the desired number of frames is reached
+            ...         if rb.write_count . 100_000:
+            ...             break
+            ...
+            ...     # Shut down the collector
+            ...     collector.async_shutdown()
+        """
         if self.replay_buffer is None:
-            raise RuntimeError("Replay buffer must be defined for asyncio execution.")
-        if self._task is None or self._task.done():
-            loop = asyncio.get_event_loop()
-            self._task = loop.create_task(self._run_iterator_silently())
+            raise RuntimeError("Replay buffer must be defined for execution.")
+        if not hasattr(self, "_thread") or not self._thread.is_alive():
+            self._stop = False
+            self._thread = threading.Thread(target=self._run_iterator)
+            self._thread.daemon = (
+                True  # So that the thread dies when the main program exits
+            )
+            self._thread.start()
 
-    async def _run_iterator_silently(self):
-        async for _ in self._asyncio_iterator():
-            # Process each item silently
-            continue
+    def _run_iterator(self):
+        for _ in self:
+            if self._stop:
+                return
 
-    async def _asyncio_iterator(self):
-        for data in self:
-            yield data
-
-    async def async_shutdown(self):
+    def async_shutdown(self, timeout: float | None = None) -> None:
         """Finishes processes started by ray.init() during async execution."""
-        if self._task is not None:
-            await self._task
+        self._stop = True
+        if hasattr(self, "_thread") and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
         self.shutdown()
 
     def _postproc(self, tensordict_out):
@@ -1517,7 +1576,7 @@ class SyncDataCollector(DataCollectorBase):
         )
         self._shuttle["collector"] = collector_metadata
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shuts down all workers and/or closes the local environment."""
         if not self.closed:
             self.closed = True
@@ -1698,10 +1757,6 @@ class _MultiDataCollector(DataCollectorBase):
             :class:`~torchrl.collectors.MultiaSyncDataCollector`
             or a derived class of these.
             Defaults to :class:`~torchrl.collectors.SyncDataCollector`.
-
-            .. note:: This keyword argument is particularly handy when local attributes need to be
-                set, such as `weight_update_receiver`.
-
         max_frames_per_traj (int, optional): Maximum steps per trajectory.
             Note that a trajectory can span across multiple batches (unless
             ``reset_at_each_iter`` is set to ``True``, see below).
@@ -1735,7 +1790,7 @@ class _MultiDataCollector(DataCollectorBase):
         reset_when_done (bool, optional): if ``True`` (default), an environment
             that return a ``True`` value in its ``"done"`` or ``"truncated"``
             entry will be reset at the corresponding indices.
-        update_at_each_batch (boolm optional): if ``True``, :meth:`update_policy_weight_()`
+        update_at_each_batch (boolm optional): if ``True``, :meth:`update_policy_weights_()`
             will be called before (sync) or after (async) each data collection.
             Defaults to ``False``.
         preemptive_threshold (:obj:`float`, optional): a value between 0.0 and 1.0 that specifies the ratio of workers
@@ -1788,33 +1843,10 @@ class _MultiDataCollector(DataCollectorBase):
             or `ManiSkills <https://github.com/haosulab/ManiSkill/>`_) cuda synchronization may cause unexpected
             crashes.
             Defaults to ``False``.
-        weight_update_receiver (WeightUpdateReceiverBase or constructor, optional): An instance of :class:`~torchrl.collectors.WeightUpdateReceiverBase`
-            or its subclass, responsible for updating the policy weights on the server worker.
-            If not provided, left unused.
-            Consider using a constructor if the updater needs to be serialized.
-
-            .. note:: This instance or constructor is not passed to the workers. To specify the workers `weight_update_receiver`
-                instance, you can pass a `collector_class` argument containing the constructor:
-
-                >>> from functools import partial
-                >>> # the weight receiver - called when `worker_collector.update_policy_weight_() is called
-                >>> worker_weight_updater_receiver = ...
-                >>> # The weight sender - called when `server_collector.update_policy_weight_()` is called
-                >>> server_weight_updater_sender = ...
-                >>> collector = MultiaSyncDataCollector(
-                ...     create_env_fn=[func, func],
-                ...     policy=policy,
-                ...     frames_per_batch=100,
-                ...     total_frames=1000,
-                ...     collector_class=partial(SyncDataCollector, weight_update_receiver=worker_weight_updater_receiver),
-                ...     weight_update_sender=server_weight_updater_sender,
-                ... )
-
-        weight_update_sender (WeightUpdateSenderBase or constructor, optional): An instance of :class:`~torchrl.collectors.WeightUpdateSenderBase`
+        weight_updater (WeightUpdaterBase or constructor, optional): An instance of :class:`~torchrl.collectors.WeightUpdaterBase`
             or its subclass, responsible for updating the policy weights on remote inference workers.
-            If not provided, a :class:`~torchrl.collectors.MultiProcessedRemoteWeightUpdate` will be used by default,
+            If not provided, a :class:`~torchrl.collectors.MultiProcessedWeightUpdater` will be used by default,
             which handles weight synchronization across multiple processes.
-            See `weight_update_receiver` for details on the server / worker weight update API.
             Consider using a constructor if the updater needs to be serialized.
 
     """
@@ -1857,11 +1889,8 @@ class _MultiDataCollector(DataCollectorBase):
         compile_policy: bool | dict[str, Any] | None = None,
         cudagraph_policy: bool | dict[str, Any] | None = None,
         no_cuda_sync: bool = False,
-        weight_update_sender: WeightUpdateSenderBase
-        | Callable[[], WeightUpdateReceiverBase]
-        | None = None,
-        weight_update_receiver: WeightUpdateReceiverBase
-        | Callable[[], WeightUpdateReceiverBase]
+        weight_updater: WeightUpdaterBase
+        | Callable[[], WeightUpdaterBase]
         | None = None,
     ):
         self.closed = True
@@ -1956,21 +1985,20 @@ class _MultiDataCollector(DataCollectorBase):
                 )
                 self._policy_weights_dict[policy_device] = weights
             self._get_weights_fn = get_weights_fn
-            if weight_update_sender is None:
-                weight_update_sender = MultiProcessedWeightUpdate(
+            if weight_updater is None:
+                weight_updater = MultiProcessedWeightUpdate(
                     get_server_weights=self._get_weights_fn,
                     policy_weights=self._policy_weights_dict,
                 )
-        elif weight_update_sender is None:
+        elif weight_updater is None:
             warnings.warn(
-                "weight_update_sender is None, but policy_factory is provided. This means that the server will "
+                "weight_updater is None, but policy_factory is provided. This means that the server will "
                 "not know how to send the weights to the workers. If the workers can handle their weight synchronization "
                 "on their own (via some specialized worker type / constructor) this may well work, but make sure "
                 "your weight synchronization strategy is properly set."
             )
 
-        self.weight_update_sender = weight_update_sender
-        self.weight_update_receiver = weight_update_receiver
+        self.weight_updater = weight_updater
 
         self.policy = policy
         self.policy_factory = policy_factory
@@ -2238,6 +2266,83 @@ also that the state dict is synchronised across processes if needed."""
         self.queue_out = queue_out
         self.closed = False
 
+    def start(self):
+        """Starts the collector(s) for asynchronous data collection.
+
+        The collected data is stored in the provided replay buffer. This method initiates the background collection of
+        data across multiple processes, allowing for decoupling of data collection and training.
+
+        Raises:
+            RuntimeError: If no replay buffer is defined during the collector's initialization.
+
+        Example:
+            >>> import time
+            >>> from functools import partial
+            >>>
+            >>> import tqdm
+            >>>
+            >>> from torchrl.collectors import MultiaSyncDataCollector, RandomPolicy
+            >>> from torchrl.data import LazyTensorStorage, ReplayBuffer
+            >>> from torchrl.envs import GymEnv, set_gym_backend
+            >>> import ale_py
+            >>>
+            >>> # Set the gym backend to gymnasium
+            >>> set_gym_backend("gymnasium").set()
+            >>>
+            >>> if __name__ == "__main__":
+            ...     # Create a random policy for the Pong environment
+            ...     env_fn = partial(GymEnv, "ALE/Pong-v5")
+            ...     policy = RandomPolicy(env_fn().action_spec)
+            ...
+            ...     # Initialize a shared replay buffer
+            ...     rb = ReplayBuffer(storage=LazyTensorStorage(10000), shared=True)
+            ...
+            ...     # Create a multi-async data collector with 16 environments
+            ...     num_envs = 16
+            ...     collector = MultiaSyncDataCollector(
+            ...         [env_fn] * num_envs,
+            ...         policy=policy,
+            ...         replay_buffer=rb,
+            ...         frames_per_batch=num_envs * 16,
+            ...         total_frames=-1,
+            ...     )
+            ...
+            ...     # Progress bar to track the number of collected frames
+            ...     pbar = tqdm.tqdm(total=100_000)
+            ...
+            ...     # Start the collector asynchronously
+            ...     collector.start()
+            ...
+            ...     # Track the write count of the replay buffer
+            ...     prec_wc = 0
+            ...     while True:
+            ...         wc = rb.write_count
+            ...         c = wc - prec_wc
+            ...         prec_wc = wc
+            ...
+            ...         # Update the progress bar
+            ...         pbar.update(c)
+            ...         pbar.set_description(f"Write Count: {rb.write_count}")
+            ...
+            ...         # Check the write count every 0.5 seconds
+            ...         time.sleep(0.5)
+            ...
+            ...         # Stop when the desired number of frames is reached
+            ...         if rb.write_count . 100_000:
+            ...             break
+            ...
+            ...     # Shut down the collector
+            ...     collector.async_shutdown()
+        """
+        if self.replay_buffer is None:
+            raise RuntimeError("Replay buffer must be defined for execution.")
+        if self.init_random_frames is not None and self.init_random_frames > 0:
+            raise RuntimeError(
+                "Cannot currently start() a collector that requires random frames. Please submit a feature request on github."
+            )
+        for pipe in self.pipes:
+            pipe.send((None, "run_free"))
+
     def __del__(self):
         try:
             self.shutdown()
@@ -2248,30 +2353,46 @@ also that the state dict is synchronised across processes if needed."""
             # __del__ will not affect the program.
             pass
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shuts down all processes. This operation is irreversible."""
-        self._shutdown_main()
+        self._shutdown_main(timeout)
 
-    def _shutdown_main(self) -> None:
+    def _shutdown_main(self, timeout: float | None = None) -> None:
+        if timeout is None:
+            timeout = 10
         try:
             if self.closed:
                 return
             _check_for_faulty_process(self.procs)
-            self.closed = True
+            all_closed = [False] * self.num_workers
+            rep = 0
             for idx in range(self.num_workers):
+                if all_closed[idx]:
+                    continue
                 if not self.procs[idx].is_alive():
                     continue
-                try:
-                    self.pipes[idx].send((None, "close"))
+                self.pipes[idx].send((None, "close"))
 
-                    if self.pipes[idx].poll(10.0):
-                        msg = self.pipes[idx].recv()
-                        if msg != "closed":
-                            raise RuntimeError(f"got {msg} but expected 'close'")
-                    else:
+            while not all(all_closed) and rep < 1000:
+                rep += 1
+                for idx in range(self.num_workers):
+                    if all_closed[idx]:
                         continue
-                except BrokenPipeError:
-                    continue
+                    if not self.procs[idx].is_alive():
+                        all_closed[idx] = True
+                        continue
+                    try:
+                        if self.pipes[idx].poll(timeout / 1000 / self.num_workers):
+                            msg = self.pipes[idx].recv()
+                            if msg != "closed":
+                                raise RuntimeError(f"got {msg} but expected 'close'")
+                            all_closed[idx] = True
+                        else:
+                            continue
+                    except BrokenPipeError:
+                        all_closed[idx] = True
+                        continue
+            self.closed = True
 
             self.queue_out.close()
             for pipe in self.pipes:
@@ -2291,6 +2412,9 @@ also that the state dict is synchronised across processes if needed."""
             for proc in self.procs:
                 if proc.is_alive():
                     proc.terminate()
+
+    def async_shutdown(self, timeout: float = None):
+        return self.shutdown(timeout=timeout)
 
     def set_seed(self, seed: int, static_seed: bool = False) -> int:
         """Sets the seeds of the environments stored in the DataCollector.
@@ -2465,7 +2589,7 @@ class MultiSyncDataCollector(_MultiDataCollector):
         ...         if i == 2:
         ...             print(data)
         ...             break
-        >>> collector>shutdown()
+        >>> collector.shutdown()
         >>> del collector
         TensorDict(
             fields={
@@ -2503,12 +2627,12 @@ class MultiSyncDataCollector(_MultiDataCollector):
         return super().next()
 
     # for RPC
-    def shutdown(self):
+    def shutdown(self, timeout: float | None = None) -> None:
         if hasattr(self, "out_buffer"):
             del self.out_buffer
         if hasattr(self, "buffers"):
             del self.buffers
-        return super().shutdown()
+        return super().shutdown(timeout=timeout)
 
     # for RPC
     def set_seed(self, seed: int, static_seed: bool = False) -> int:
@@ -2874,10 +2998,10 @@ class MultiaSyncDataCollector(_MultiDataCollector):
         return super().next()
 
     # for RPC
-    def shutdown(self):
+    def shutdown(self, timeout: float | None = None) -> None:
         if hasattr(self, "out_tensordicts"):
             del self.out_tensordicts
-        return super().shutdown()
+        return super().shutdown(timeout=timeout)
 
     # for RPC
     def set_seed(self, seed: int, static_seed: bool = False) -> int:
@@ -2992,10 +3116,10 @@ class MultiaSyncDataCollector(_MultiDataCollector):
         # self._shutdown_main()
         self.running = False
 
-    def _shutdown_main(self) -> None:
+    def _shutdown_main(self, *args, **kwargs) -> None:
         if hasattr(self, "out_tensordicts"):
             del self.out_tensordicts
-        return super()._shutdown_main()
+        return super()._shutdown_main(*args, **kwargs)
 
     def reset(self, reset_idx: Sequence[bool] | None = None) -> None:
         super().reset(reset_idx)
@@ -3137,7 +3261,7 @@ class aSyncDataCollector(MultiaSyncDataCollector):
         reset_when_done (bool, optional): if ``True`` (default), an environment
             that return a ``True`` value in its ``"done"`` or ``"truncated"``
             entry will be reset at the corresponding indices.
-        update_at_each_batch (boolm optional): if ``True``, :meth:`update_policy_weight_()`
+        update_at_each_batch (boolm optional): if ``True``, :meth:`update_policy_weights_()`
             will be called before (sync) or after (async) each data collection.
             Defaults to ``False``.
         preemptive_threshold (:obj:`float`, optional): a value between 0.0 and 1.0 that specifies the ratio of workers
@@ -3215,8 +3339,8 @@ class aSyncDataCollector(MultiaSyncDataCollector):
         return super().next()
 
     # for RPC
-    def shutdown(self):
-        return super().shutdown()
+    def shutdown(self, timeout: float | None = None) -> None:
+        return super().shutdown(timeout=timeout)
 
     # for RPC
     def set_seed(self, seed: int, static_seed: bool = False) -> int:
@@ -3304,14 +3428,15 @@ def _main_async_collector(
 
     has_timed_out = False
     counter = 0
+    run_free = False
     while True:
         _timeout = _TIMEOUT if not has_timed_out else 1e-3
-        if pipe_child.poll(_timeout):
+        if not run_free and pipe_child.poll(_timeout):
             counter = 0
             data_in, msg = pipe_child.recv()
             if verbose:
                 torchrl_logger.info(f"worker {idx} received {msg}")
-        else:
+        elif not run_free:
             if verbose:
                 torchrl_logger.info(f"poll failed, j={j}, worker={idx}")
             # default is "continue" (after first iteration)
@@ -3344,12 +3469,27 @@ def _main_async_collector(
                         f"collected, consider calling `collector.shutdown()` before ending the program."
                     )
                 continue
+        else:
+            # placeholder, will be checked after
+            msg = "continue"
+        if msg == "run_free":
+            run_free = True
+        if run_free:
+            # Capture shutdown / update / seed signal, but continue should not be expected
+            if pipe_child.poll(1e-3):
+                data_in, msg = pipe_child.recv()
+                if msg == "continue":
+                    # Switch back to run_free = False
+                    run_free = False
+            else:
+                data_in = None
+                # TODO: this does not work with random frames
+                msg = "continue"
         if msg in ("continue", "continue_random"):
             if msg == "continue_random":
                 inner_collector.init_random_frames = float("inf")
             else:
                 inner_collector.init_random_frames = -1
-
             next_data = next(dc_iter)
             if pipe_child.poll(_MIN_TIMEOUT):
                 # in this case, main send a message to the worker while it was busy collecting trajectories.
@@ -3361,6 +3501,9 @@ def _main_async_collector(
                 if not extend_buffer:
                     next_data.names = None
                     replay_buffer.extend(next_data)
+
+                if run_free:
+                    continue
 
                 try:
                     queue_out.put((idx, j), timeout=_TIMEOUT)
