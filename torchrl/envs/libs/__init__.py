@@ -26,6 +26,7 @@ from .robohive import RoboHiveEnv
 from .smacv2 import SMACv2Env, SMACv2Wrapper
 from .unity_mlagents import UnityMLAgentsEnv, UnityMLAgentsWrapper
 from .vmas import VmasEnv, VmasWrapper
+from .isaaclab import IsaacLabWrapper
 
 __all__ = [
     "BraxEnv",
